@@ -1,122 +1,169 @@
-/* tslint:disable */
-import {core, flags, SfdxCommand} from '@salesforce/command';
-import * as _ from 'lodash';
-import fs = require('fs-extra');
-import convert = require('xml-js');
-import path = require('path');
-import config = require('../../../shared/config.json');
-import chalk from 'chalk';
+import { SfCommand, Flags } from '@salesforce/sf-plugins-core';
+import { Messages } from '@salesforce/core';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as xml2js from 'xml2js';
 
-function createModel() {
-    const data = {
-        _declaration: {
-            _attributes: {
-                version: '1.0',
-                encoding: 'UTF-8'
-            }
-        },
-        Profile: {
-            _attributes: {
-                xmlns: 'http://soap.sforce.com/2006/04/metadata'
-            }
-        }
-    };
+Messages.importMessagesDirectory(__dirname);
+const messages = Messages.loadMessages('sf-profiles-splitter', 'merge');
 
-    return data;
-}
+export default class Merge extends SfCommand<void> {
+  public static summary = messages.getMessage('summary');
+  public static description = messages.getMessage('description');
+  
+  public static examples = [
+    '$ sf metadata profiles merge -i force-app/main/default/profiles-split -o force-app/main/default/profiles'
+  ];
 
-async function getDirs(location) {
-    let dirs = [];
+  public static flags = {
+    input: Flags.directory({
+      char: 'i',
+      summary: messages.getMessage('flags.input.summary'),
+      description: messages.getMessage('flags.input.description'),
+      default: 'force-app/main/default/profiles',
+      required: true
+    }),
+    output: Flags.directory({
+      char: 'o',
+      summary: messages.getMessage('flags.output.summary'),
+      description: messages.getMessage('flags.output.description'),
+      default: 'force-app/main/default/profiles',
+      required: true
+    }),
+    delete: Flags.boolean({
+      char: 'd',
+      summary: messages.getMessage('flags.delete.summary'),
+      description: messages.getMessage('flags.delete.description'),
+      default: false
+    })
+  };
 
-    for (const file of await fs.readdir(location)) {
-        if ((await fs.stat(path.join(location, file))).isDirectory()) {
-            dirs = [...dirs, path.join(location, file)];
-        }
+  // For backward compatibility during transition
+  public static deprecateAliases = true;
+  // This allows the old command format to still work
+  public static aliases = ['metadata:profiles:merge'];
+
+  public async run(): Promise<void> {
+    const { flags } = await this.parse(Merge);
+    
+    const inputDir = flags.input;
+    const outputDir = flags.output;
+    const shouldDelete = flags.delete;
+
+    this.log(`Merging profiles from ${inputDir} to ${outputDir}`);
+    
+    // Check if the input directory exists
+    if (!fs.existsSync(inputDir)) {
+      throw new Error(`Input directory ${inputDir} does not exist`);
     }
 
-    return dirs;
-}
+    // Create the output directory if it does not exist
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
+    }
 
-export default class Merge extends SfdxCommand {
-    public static description = 'Merge profiles that were split.';
+    // Get all profile directories in the input directory
+    const profileDirs = fs.readdirSync(inputDir)
+      .filter(item => fs.statSync(path.join(inputDir, item)).isDirectory())
+      .map(dir => path.join(inputDir, dir));
 
-    public static examples = [`
-        sfdx metadata:profiles:merge -i force-app/main/default/profiles -o force-app/main/default/test
-        //Merges profiles located in specified input dir and copies them into the output dir.
-    `];
+    if (profileDirs.length === 0) {
+      this.log('No profile directories found in the input directory');
+      return;
+    }
 
-    protected static flagsConfig = {
-        input: flags.string({char: 'i', default: 'force-app/main/default/profiles', required: true, description: 'the input directory where the splitted profiles exist.'}),
-        output: flags.string({char: 'o', default: 'force-app/main/default/profiles', required: true, description: 'the output directory to store the full profiles.'}),
-        delete: flags.boolean({char: 'd', default: false, description: 'Delete the splitted profiles once merged?'}) 
+    this.log(`Found ${profileDirs.length} profile directories`);
+
+    // Process each profile directory
+    for (const profileDir of profileDirs) {
+      await this.mergeProfile(profileDir, outputDir);
+    }
+
+    // Delete the original directories if requested
+    if (shouldDelete) {
+      for (const profileDir of profileDirs) {
+        this.deleteDirectory(profileDir);
+        this.log(`Deleted original directory: ${profileDir}`);
+      }
+    }
+
+    this.log('Profile merging completed successfully');
+  }
+
+  private async mergeProfile(profileDir: string, outputDir: string): Promise<void> {
+    const profileName = path.basename(profileDir);
+    this.log(`Processing profile: ${profileName}`);
+
+    // Create a new profile object
+    const profile: any = {
+      _xmlns: 'http://soap.sforce.com/2006/04/metadata'
     };
 
-    // Set this to true if your command requires a project workspace; 'requiresProject' is false by default
-    protected static requiresProject = false;
+    // Get all subdirectories (categories) in the profile directory
+    const categoryDirs = fs.readdirSync(profileDir)
+      .filter(item => fs.statSync(path.join(profileDir, item)).isDirectory())
+      .map(dir => path.join(profileDir, dir));
 
-    public async merge(inputDir: string, outputDir: string, deleteProfile: boolean): Promise<any> {
+    for (const categoryDir of categoryDirs) {
+      const categoryName = path.basename(categoryDir);
+      this.log(`  Processing category: ${categoryName}`);
+
+      // Get all XML files in this category
+      const itemFiles = fs.readdirSync(categoryDir)
+        .filter(file => file.endsWith('.xml'))
+        .map(file => path.join(categoryDir, file));
+
+      if (itemFiles.length === 0) {
+        continue;
+      }
+
+      // Process each item file
+      for (const itemFile of itemFiles) {
         try {
-            const root = path.resolve(inputDir);
+          const itemContent = fs.readFileSync(itemFile, 'utf-8');
+          const parser = new xml2js.Parser();
+          const result = await parser.parseStringPromise(itemContent);
 
-            const location = path.resolve(outputDir);
-            await fs.ensureDir(location);
-
-            const rootDirs = await getDirs(root);
-
-            for (const rootDir of rootDirs) {
-                this.ux.log(chalk.bold(chalk.black(('Merging profile: ' + path.basename(rootDir)))));
-                
-                const model = createModel();
-                const metaDirs = await getDirs(rootDir);
-
-                for (const metaDir of metaDirs) {
-                    const metadataType = path.basename(metaDir);
-                    model.Profile[metadataType] = [];
-
-                    const fileNames = await fs.readdir(metaDir);
-
-                    for (const fileName of fileNames) {
-                        const filePath = metaDir + '/' + fileName;
-
-                        const file = await fs.readFile(filePath);
-                        const stream = convert.xml2js(file.toString(), config.jsonExport);
-
-                        // Is this needed here??
-                        if (stream['Profile'][metadataType] === undefined) {
-                            continue;
-                        }
-
-                        model.Profile[metadataType] = [...model.Profile[metadataType], stream['Profile'][metadataType]];
-                    }
-
-                    model.Profile[metadataType] = _.flatten(model.Profile[metadataType]);
-                }
-
-                await fs.writeFile( 
-                    location + '/' + path.basename(rootDir) + '.profile-meta.xml',
-                    convert.json2xml(JSON.stringify(model), config.xmlExport)
-                );
-
-                if (deleteProfile === true) {
-                    await fs.remove(rootDir);
-                }
+          // Extract the profile data
+          if (result.Profile && result.Profile[categoryName]) {
+            const items = result.Profile[categoryName];
+            if (Array.isArray(items) && items.length > 0) {
+              // Initialize the category array if it doesn't exist
+              if (!profile[categoryName]) {
+                profile[categoryName] = [];
+              }
+              
+              // Add the items to the profile
+              profile[categoryName].push(...items);
             }
-        } catch(ex) {
-            this.ux.error(chalk.bold(chalk.red(ex)));
-            return 1;
+          }
+        } catch (error) {
+          this.error(`Error processing item file ${itemFile}: ${error.message}`);
         }
-
-        return 0;
+      }
     }
 
-    public async run(): Promise<core.AnyJson> {
-        const inputDir = this.flags.input;
-        const outputDir = this.flags.output;
-        const deleteProfile = this.flags.delete;
-        
-        await this.merge(inputDir, outputDir, deleteProfile);
+    // Create the full profile XML
+    const builder = new xml2js.Builder();
+    const profileXml = builder.buildObject({ Profile: profile });
 
-        // Return an object to be displayed with --json
-        return {};
+    // Write the profile to a file
+    const outputFile = path.join(outputDir, `${profileName}.profile-meta.xml`);
+    fs.writeFileSync(outputFile, profileXml);
+    this.log(`Created merged profile: ${outputFile}`);
+  }
+
+  private deleteDirectory(directory: string): void {
+    if (fs.existsSync(directory)) {
+      fs.readdirSync(directory).forEach(file => {
+        const currentPath = path.join(directory, file);
+        if (fs.statSync(currentPath).isDirectory()) {
+          this.deleteDirectory(currentPath);
+        } else {
+          fs.unlinkSync(currentPath);
+        }
+      });
+      fs.rmdirSync(directory);
     }
+  }
 }
